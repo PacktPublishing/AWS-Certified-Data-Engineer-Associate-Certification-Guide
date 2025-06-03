@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: 'Chapter 01 Lab - Building a Health Statistics Data Quality Pipeline'
+
+Metadata: 
+
+Parameters: 
+
+Mappings: 
+
+Conditions: 
+
+Resources: 
+
+  # An S3 bucket for data storage
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ""
+      AccessControl: Private
+      DeletePolicy: Retain
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Disabled
+      Tags:
+        - Key: "FriendlyName"
+          Value: "Health Statistics - Raw Data"
+
+
+
+Outputs:
