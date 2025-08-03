@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This template creates the necessary resources for all chapters for
+  PacktPub DAE-C01 certification
+
+Parameters:
+  Region:
+    Type: String
+    Default: ap-southeast-2
+    Description: AWS region for the resources
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - af-south-1
+      - ap-east-1
+      - ap-south-1
+      - ap-northeast-1
+      - ap-northeast-2
+      - ap-northeast-3
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-southeast-3
+      - ap-southeast-4
+      - ca-central-1
+      - eu-central-1
+      - eu-central-2
+      - eu-west-1
+      - eu-west-2
+      - eu-west-3
+      - eu-north-1
+      - eu-south-1
+      - eu-south-2
+      - me-south-1
+      - me-central-1
+      - sa-east-1
+      - us-gov-east-1
+      - us-gov-west-1
+  S3BucketName:
+    Type: String
+    Default: !Sub dea-c01-data-source-bucket-${AWS::AccountId}
+    Description: Name for the S3 bucket to store raw data
+  DynamoDBTableName:
+    Type: String
+    Default: !Sub dea-c01-data-table-${AWS::AccountId}
+    Description: Name for the DynamoDB table to store processed data
+
+Resources:
+
+  # This is the SOURCE where our raw data resides and we extract from this
+  # source
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TransformLambdaFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: Project
+          Value: PacktPub
+        - Key: Chapter
+          Value: '02'
+        - Key: Certification
+          Value: DAE-C01
+
+  # This is the TRANSFORM resource, this is the lambda function which will
+  # read the data from the S3 bucket and add an additional UUID and use the
+  # aws sdk to push data to the DynamoDB table 
+  TransformLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dea-c01-data-transform-lambda-role-${AWS::AccountId}
+      Description: Lambda Execution Role for Chapter 02
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DynamoDBTable.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub ${S3Bucket}/*
+      Tags:
+        - Key: Project
+          Value: PacktPub
+        - Key: Chapter
+          Value: '02'
+        - Key: Certification
+          Value: DAE-C01
+
+  TransformLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dea-c01-data-transform-lambda-fn-${AWS::AccountId}
+      Description: Chapter 02 generic data processing function
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt TransformLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTableName
+      Layers:
+        - !Sub arn:aws:lambda:${Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-arm64:18
+      Code:
+        ZipFile: |
+          import io
+          import json
+          import uuid
+          import boto3
+          import numpy as np
+          import pandas as pd
+          import urllib.parse
+          import awswrangler as wr
+          import os
+          from decimal import Decimal
+
+          s3 = boto3.client('s3')
+          ddb_resource = boto3.resource('dynamodb')
+          pd.set_option('future.no_silent_downcasting', True)
+
+          def lambda_handler(event, context):
+              # print("Received event: " + json.dumps(event, indent=2))
+              print("Object created: "+event['Records'][0]['s3']['object']['key'])
+
+              # Get the object from the event and show its content type
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+
+              # Construct the ARN
+              s3_arn = f"arn:aws:s3:::{bucket}/{key}"
+
+              try:
+
+                  print("Processing object: "+key)
+                  response = s3.get_object(Bucket=bucket, Key=key)
+
+                  print("Decoding CSV body")
+                  csv_content = response['Body'].read().decode('utf-8')
+
+                  print("Creating a pandas dataframe based on the contents")
+                  dataFrame = pd.read_csv(io.StringIO(csv_content))
+
+                  print("Dropping first 2 rows - [0, 1]")
+                  dataFrame = dataFrame.drop(index=[0, 1])
+
+                  print("Replace all empty records with 0 - fillna(0)")
+                  dataFrame = dataFrame.fillna(0)
+
+                  # Create a list of UUIDs, one for each row in the DataFrame
+                  uuids = [str(uuid.uuid4()) for _ in range(len(dataFrame))]
+
+                  # Insert the new 'uuid' column at the beginning of the DataFrame (position 0)
+                  dataFrame.insert(0, 'uuid', uuids)
+
+                  # Insert the new 'key' column at the beginning of the DataFrame (position 1)
+                  dataFrame.insert(1, 'object_key', s3_arn)
+
+                  # Define your DynamoDB table name
+                  table_name = os.environ['TABLE_NAME']
+
+                  print("Convert float values to Decimal for DynamoDB compatibility")
+                  # Convert float columns to Decimal
+                  for col in dataFrame.select_dtypes(include=['float']).columns:
+                      dataFrame[col] = dataFrame[col].apply(lambda x: Decimal(str(x)))
+
+                  print("Push DataFrame to DynamoDB")
+                  wr.dynamodb.put_df(df=dataFrame, table_name=table_name)
+
+                  print("File loaded into DynamoDB table successfully.")
+
+              except Exception as e:
+                  print(e)
+                  print({
+                      "statusCode": 500,
+                      "body": {
+                          "exception": str(e),
+                          "message": "Error getting object {} from bucket {}. Make sure they exist and your bucket is in the same region as this function.".format(key, bucket)
+                          }
+                      })
+      Runtime: python3.12
+      Tags:
+        - Key: Project
+          Value: PacktPub
+        - Key: Chapter
+          Value: '02'
+        - Key: Certification
+          Value: DAE-C01
+
+  # Lambda permission to allow S3 to invoke the function
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt S3Bucket.Arn
+
+  # This is the LOAD resource, this is where we put our data into
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: PacktPub
+        - Key: Chapter
+          Value: '02'
+        - Key: Certification
+          Value: DAE-C01
