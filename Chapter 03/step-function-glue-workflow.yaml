@@ -1,0 +1,634 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for orchestrating AWS Glue crawlers using Step Functions for nutrition dataset processing'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'nutrition-data-pipeline'
+    Description: 'Project name used for resource naming'
+  
+  DataBucketName:
+    Type: String
+    Description: 'S3 bucket name for storing raw and processed data (must be globally unique)'
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    ConstraintDescription: 'Bucket name must be lowercase, alphanumeric with hyphens'
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+Resources:
+  # S3 Buckets
+  DataLakeBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref DataBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # Glue Database
+  NutritionGlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${ProjectName}-database'
+        Description: 'Database for nutrition, physical activity, and obesity data'
+
+  # IAM Role for Glue Crawler
+  GlueCrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-crawler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # Glue Crawlers
+  RawDataCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Sub '${ProjectName}-raw-data-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref NutritionGlueDatabase
+      Description: 'Crawler for raw nutrition CSV data'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucketName}/raw/'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"}
+          }
+        }
+
+  CleanedDataCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Sub '${ProjectName}-cleaned-data-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref NutritionGlueDatabase
+      Description: 'Crawler for cleaned and validated nutrition data'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucketName}/cleaned/'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+
+  EnrichedDataCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Sub '${ProjectName}-enriched-data-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref NutritionGlueDatabase
+      Description: 'Crawler for enriched nutrition data with geographic and demographic enhancements'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucketName}/enriched/'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+
+  AggregatedDataCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: !Sub '${ProjectName}-aggregated-data-crawler'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref NutritionGlueDatabase
+      Description: 'Crawler for aggregated nutrition data by state and demographics'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucketName}/aggregated/'
+      SchemaChangePolicy:
+        UpdateBehavior: 'UPDATE_IN_DATABASE'
+        DeleteBehavior: 'LOG'
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: GlueCrawlerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:StartCrawler'
+                  - 'glue:GetCrawler'
+                  - 'glue:GetCrawlerMetrics'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/${RawDataCrawler}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/${CleanedDataCrawler}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/${EnrichedDataCrawler}'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/${AggregatedDataCrawler}'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref NotificationTopic
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogDelivery'
+                  - 'logs:GetLogDelivery'
+                  - 'logs:UpdateLogDelivery'
+                  - 'logs:DeleteLogDelivery'
+                  - 'logs:ListLogDeliveries'
+                  - 'logs:PutResourcePolicy'
+                  - 'logs:DescribeResourcePolicies'
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications'
+      DisplayName: 'Nutrition Data Pipeline Notifications'
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # Step Functions State Machine
+  DataPipelineStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-orchestration'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      StateMachineType: STANDARD
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Orchestrate AWS Glue crawlers for nutrition data pipeline with parallel processing and error handling",
+          "StartAt": "StartRawDataCrawler",
+          "States": {
+            "StartRawDataCrawler": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${RawDataCrawler}"
+              },
+              "ResultPath": "$.rawCrawlerStart",
+              "Catch": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "ResultPath": "$.error",
+                  "Next": "WaitForRawCrawler"
+                },
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "WaitForRawCrawler"
+            },
+            "WaitForRawCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckRawCrawlerStatus"
+            },
+            "CheckRawCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${RawDataCrawler}"
+              },
+              "ResultPath": "$.rawCrawlerStatus",
+              "Next": "IsRawCrawlerComplete"
+            },
+            "IsRawCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rawCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "CheckRawCrawlerLastRunStatus"
+                }
+              ],
+              "Default": "WaitForRawCrawler"
+            },
+            "CheckRawCrawlerLastRunStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rawCrawlerStatus.Crawler.LastCrawl.Status",
+                  "StringEquals": "SUCCEEDED",
+                  "Next": "ParallelDataQualityChecks"
+                },
+                {
+                  "Variable": "$.rawCrawlerStatus.Crawler.LastCrawl.Status",
+                  "StringEquals": "FAILED",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Default": "NotifyFailure"
+            },
+            "ParallelDataQualityChecks": {
+              "Type": "Parallel",
+              "ResultPath": "$.qualityChecks",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Branches": [
+                {
+                  "StartAt": "ValidateMissingValues",
+                  "States": {
+                    "ValidateMissingValues": {
+                      "Type": "Pass",
+                      "Result": {
+                        "CheckName": "MissingValues",
+                        "Status": "PASSED"
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "ValidateDataRanges",
+                  "States": {
+                    "ValidateDataRanges": {
+                      "Type": "Pass",
+                      "Result": {
+                        "CheckName": "DataRanges",
+                        "Status": "PASSED"
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "ValidateConfidenceIntervals",
+                  "States": {
+                    "ValidateConfidenceIntervals": {
+                      "Type": "Pass",
+                      "Result": {
+                        "CheckName": "ConfidenceIntervals",
+                        "Status": "PASSED"
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "StartCleanedDataCrawler"
+            },
+            "StartCleanedDataCrawler": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${CleanedDataCrawler}"
+              },
+              "ResultPath": "$.cleanedCrawlerStart",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "WaitForCleanedCrawler"
+            },
+            "WaitForCleanedCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckCleanedCrawlerStatus"
+            },
+            "CheckCleanedCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${CleanedDataCrawler}"
+              },
+              "ResultPath": "$.cleanedCrawlerStatus",
+              "Next": "IsCleanedCrawlerComplete"
+            },
+            "IsCleanedCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.cleanedCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "StartEnrichedDataCrawler"
+                }
+              ],
+              "Default": "WaitForCleanedCrawler"
+            },
+            "StartEnrichedDataCrawler": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${EnrichedDataCrawler}"
+              },
+              "ResultPath": "$.enrichedCrawlerStart",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "WaitForEnrichedCrawler"
+            },
+            "WaitForEnrichedCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckEnrichedCrawlerStatus"
+            },
+            "CheckEnrichedCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${EnrichedDataCrawler}"
+              },
+              "ResultPath": "$.enrichedCrawlerStatus",
+              "Next": "IsEnrichedCrawlerComplete"
+            },
+            "IsEnrichedCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.enrichedCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "StartAggregatedDataCrawler"
+                }
+              ],
+              "Default": "WaitForEnrichedCrawler"
+            },
+            "StartAggregatedDataCrawler": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${AggregatedDataCrawler}"
+              },
+              "ResultPath": "$.aggregatedCrawlerStart",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.CrawlerRunningException"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "NotifyFailure"
+                }
+              ],
+              "Next": "WaitForAggregatedCrawler"
+            },
+            "WaitForAggregatedCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckAggregatedCrawlerStatus"
+            },
+            "CheckAggregatedCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${AggregatedDataCrawler}"
+              },
+              "ResultPath": "$.aggregatedCrawlerStatus",
+              "Next": "IsAggregatedCrawlerComplete"
+            },
+            "IsAggregatedCrawlerComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.aggregatedCrawlerStatus.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "NotifySuccess"
+                }
+              ],
+              "Default": "WaitForAggregatedCrawler"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject": "Data Pipeline Execution Successful",
+                "Message.$": "States.Format('Pipeline execution completed successfully. Execution ID: {}', $$.Execution.Name)"
+              },
+              "End": true
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject": "Data Pipeline Execution Failed",
+                "Message.$": "States.Format('Pipeline execution failed. Execution ID: {}. Error: {}', $$.Execution.Name, $.error)"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionsLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${ProjectName}-orchestration'
+      RetentionInDays: 30
+
+  # EventBridge Rule to trigger Step Functions on S3 upload
+  S3UploadEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-s3-upload-trigger'
+      Description: 'Trigger Step Functions when CSV file is uploaded to raw folder'
+      EventPattern:
+        source:
+          - 'aws.s3'
+        detail-type:
+          - 'Object Created'
+        detail:
+          bucket:
+            name:
+              - !Ref DataBucketName
+          object:
+            key:
+              - prefix: 'raw/'
+              - suffix: '.csv'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataPipelineStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Id: StepFunctionsTarget
+
+  # IAM Role for EventBridge
+  EventBridgeExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StartStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !GetAtt DataPipelineStateMachine.Arn
+
+
+Outputs:
+  DataLakeBucketName:
+    Description: 'S3 bucket for data lake'
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${ProjectName}-bucket'
+
+  GlueDatabaseName:
+    Description: 'Glue database name'
+    Value: !Ref NutritionGlueDatabase
+    Export:
+      Name: !Sub '${ProjectName}-database'
+
+  StateMachineArn:
+    Description: 'Step Functions state machine ARN'
+    Value: !GetAtt DataPipelineStateMachine.Arn
+    Export:
+      Name: !Sub '${ProjectName}-statemachine'
+
+  NotificationTopicArn:
+    Description: 'SNS topic for pipeline notifications'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-notifications'
+
+  RawDataCrawlerName:
+    Description: 'Raw data crawler name'
+    Value: !Ref RawDataCrawler
+
+  CleanedDataCrawlerName:
+    Description: 'Cleaned data crawler name'
+    Value: !Ref CleanedDataCrawler
+
+  EnrichedDataCrawlerName:
+    Description: 'Enriched data crawler name'
+    Value: !Ref EnrichedDataCrawler
+
+  AggregatedDataCrawlerName:
+    Description: 'Aggregated data crawler name'
+    Value: !Ref AggregatedDataCrawler
+
